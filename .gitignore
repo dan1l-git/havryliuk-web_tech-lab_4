@@ -1,0 +1,13 @@
+# Віртуальне середовище Python
+venv/
+
+# SSL Сертифікати
+certs/
+
+# Системні файли macOS
+.DS_Store
+
+# Кеш Python та PyCharm
+__pycache__/
+*.pyc
+.idea/

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OIDC Web Service - Crypto Tracker</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 40px; background-color: #f4f4f9; }
+        .container { max-width: 600px; margin: auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 20px;}
+        button { padding: 10px 20px; margin-right: 10px; cursor: pointer; border: none; border-radius: 5px; font-weight: bold; }
+
+        .btn-login { background-color: #007bff; color: white; }
+        .btn-info { background-color: #28a745; color: white; }
+        .btn-start { background-color: #ffc107; color: black; }
+        .btn-stop { background-color: #dc3545; color: white; }
+
+        #output { background: #e9ecef; padding: 15px; border-radius: 5px; overflow-x: auto; font-family: monospace; }
+
+        /* Стилі для чекбоксів */
+        .checkbox-group { margin-bottom: 15px; display: flex; gap: 15px; }
+        .checkbox-group label { display: flex; align-items: center; cursor: pointer; font-weight: 500;}
+        .checkbox-group input { margin-right: 5px; width: 16px; height: 16px; cursor: pointer; }
+
+        /* Стилі для карток з цінами */
+        .cards-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
+        .price-card {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 20px;
+            background-color: #f8f9fa; /* Базовий колір (до першого оновлення) */
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            font-size: 18px;
+            font-family: monospace;
+            font-weight: bold;
+            transition: background-color 0.4s ease, color 0.4s ease; /* Плавне перетікання кольорів */
+        }
+
+        /* Класи для постійного тренду */
+        .trend-up { background-color: #d4edda !important; color: #155724 !important; border-color: #c3e6cb !important; }
+        .trend-down { background-color: #f8d7da !important; color: #721c24 !important; border-color: #f5c6cb !important; }
+
+        .status-text { margin-top: 10px; font-size: 14px; color: #6c757d; font-style: italic; }
+    </style>
+
+    <script src="https://cdn.jsdelivr.net/npm/protobufjs@7.2.5/dist/protobuf.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h2>Аутентифікація через Casdoor (OIDC)</h2>
+        <button class="btn-login" onclick="window.location.href='/login'">Login</button>
+        <button class="btn-info" onclick="getUserInfo()">Get User Info</button>
+
+        <h4 style="margin-top: 20px;">Результат:</h4>
+        <pre id="output">Натисніть кнопку вище...</pre>
+    </div>
+
+    <div class="container">
+        <h2>Живі ціни Binance (Protobuf)</h2>
+
+        <div class="checkbox-group">
+            <label><input type="checkbox" class="crypto-cb" value="BTCUSDT" checked> BTC</label>
+            <label><input type="checkbox" class="crypto-cb" value="ETHUSDT"> ETH</label>
+            <label><input type="checkbox" class="crypto-cb" value="SOLUSDT"> SOL</label>
+            <label><input type="checkbox" class="crypto-cb" value="BNBUSDT"> BNB</label>
+        </div>
+
+        <div style="margin-bottom: 15px;">
+            <button class="btn-start" onclick="startStream()">Get prices</button>
+            <button class="btn-stop" onclick="stopStream()">Stop Stream</button>
+        </div>
+
+        <h4>Потік даних:</h4>
+        <div id="status-text" class="status-text">Очікування підключення...</div>
+
+        <div id="price-cards" class="cards-container"></div>
+    </div>
+
+    <script>
+        async function getUserInfo() {
+            const output = document.getElementById('output');
+            output.innerText = "Завантаження...";
+            try {
+                const response = await fetch('/user-info');
+                if (response.status === 401) {
+                    output.innerText = "401 Unauthorized: Аутентифікаційний токен відсутній або невалідний.";
+                } else if (response.ok) {
+                    const data = await response.json();
+                    output.innerText = JSON.stringify(data, null, 2);
+                } else {
+                    output.innerText = `Помилка: ${response.status}`;
+                }
+            } catch (error) {
+                output.innerText = "Помилка з'єднання.";
+            }
+        }
+
+        let socket = null;
+        let PriceUpdateMessage = null;
+        let previousPrices = {};
+
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+            return null;
+        }
+
+        protobuf.load("/static/message.proto", function(err, root) {
+            if (err) {
+                console.error("Помилка завантаження файлу message.proto:", err);
+                return;
+            }
+            PriceUpdateMessage = root.lookupType("PriceUpdate");
+        });
+
+        function startStream() {
+            const statusText = document.getElementById('status-text');
+            const cardsContainer = document.getElementById('price-cards');
+
+            const checkedBoxes = document.querySelectorAll('.crypto-cb:checked');
+            const symbols = Array.from(checkedBoxes).map(cb => cb.value);
+
+            if (symbols.length === 0) {
+                alert("Виберіть хоча б одну криптовалюту!");
+                return;
+            }
+
+            cardsContainer.innerHTML = '';
+            previousPrices = {};
+
+            if (!socket || socket.readyState !== WebSocket.OPEN) {
+                statusText.innerHTML = "Підключення до захищеного WebSocket...";
+
+                const token = getCookie("access_token");
+                socket = new WebSocket(`wss://localhost/ws?token=${token}`);
+                socket.binaryType = "arraybuffer";
+
+                socket.onopen = function(e) {
+                    statusText.innerHTML = `<span style="color: green;">З'єднання встановлено. Відстежуємо: ${symbols.join(', ')}</span>`;
+
+                    symbols.forEach(sym => {
+                        socket.send(JSON.stringify({action: "subscribe", symbol: sym}));
+                    });
+                };
+
+                socket.onmessage = function(event) {
+                    if (!PriceUpdateMessage) return;
+
+                    const buffer = new Uint8Array(event.data);
+                    const decodedMessage = PriceUpdateMessage.decode(buffer);
+
+                    const symbol = decodedMessage.symbol;
+                    const newPrice = parseFloat(decodedMessage.price);
+
+                    let card = document.getElementById(`card-${symbol}`);
+                    if (!card) {
+                        card = document.createElement('div');
+                        card.id = `card-${symbol}`;
+                        card.className = 'price-card';
+                        card.innerHTML = `
+                            <span class="symbol-name">${symbol}</span>
+                            <span class="symbol-price" id="price-${symbol}">$${newPrice.toFixed(2)}</span>
+                        `;
+                        cardsContainer.appendChild(card);
+                    }
+
+                    document.getElementById(`price-${symbol}`).innerText = `$${newPrice.toFixed(2)}`;
+
+                    // --- ОНОВЛЕНА ЛОГІКА ПІДСВІТКИ (БЕЗ ТАЙМЕРА) ---
+                    const oldPrice = previousPrices[symbol];
+
+                    // Перевіряємо, чи є стара ціна (щоб не фарбувати при першому ж повідомленні)
+                    if (oldPrice !== undefined) {
+                        if (newPrice > oldPrice) {
+                            card.classList.remove('trend-down');
+                            card.classList.add('trend-up');
+                        } else if (newPrice < oldPrice) {
+                            card.classList.remove('trend-up');
+                            card.classList.add('trend-down');
+                        }
+                        // Якщо ціни рівні, ми нічого не робимо (зберігається старий колір)
+                    }
+
+                    // Запам'ятовуємо ціну для наступного тіку
+                    previousPrices[symbol] = newPrice;
+                };
+
+                socket.onclose = function(event) {
+                    if (event.code === 1008) {
+                        statusText.innerHTML = `<span style="color: red;">Помилка 1008: Доступ заборонено (Немає валідного токена). Спочатку натисніть Login.</span>`;
+                    } else {
+                        statusText.innerHTML = `<span style="color: orange;">Потік зупинено.</span>`;
+                    }
+                    socket = null;
+                };
+            } else {
+                statusText.innerHTML = `<span style="color: green;">Оновлення підписок: ${symbols.join(', ')}</span>`;
+
+                socket.send(JSON.stringify({action: "unsubscribe"}));
+
+                setTimeout(() => {
+                    symbols.forEach(sym => {
+                        socket.send(JSON.stringify({action: "subscribe", symbol: sym}));
+                    });
+                }, 50);
+            }
+        }
+
+        function stopStream() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({action: "unsubscribe"}));
+                socket.close();
+            }
+        }
+    </script>
+</body>
+</html>
