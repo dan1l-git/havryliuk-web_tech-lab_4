@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 import httpx
+import jwt
 import message_pb2
 
 # Конфігурація Casdoor
@@ -53,6 +54,7 @@ class ConnectionManager:
                 except:
                     self.unsubscribe(connection)
 
+
 manager = ConnectionManager()
 
 
@@ -69,7 +71,6 @@ async def binance_stream():
                     res = await ws.recv()
                     data = json.loads(res)
                     symbol = data['s']
-                    #print(f"Отримано з Binance: {symbol} - {data['p']}")
                     await manager.broadcast(symbol, data)
         except Exception as e:
             print(f"Binance connection error: {e}")
@@ -77,6 +78,7 @@ async def binance_stream():
 
 
 background_tasks = set()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -93,14 +95,53 @@ templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="."), name="static")
 
 
+# --- ДОПОМІЖНА ФУНКЦІЯ ДЛЯ ВАЛІДАЦІЇ JWT ---
+async def verify_casdoor_token(token: str):
+    """Отримує публічні ключі від Casdoor і локально перевіряє підпис токена"""
+    async with httpx.AsyncClient(verify=False) as client:
+        jwks_res = await client.get(f"{CASDOOR_URL}/.well-known/jwks")
+        jwks_res.raise_for_status()
+
+    jwks_data = jwks_res.json()
+
+    public_keys = {}
+    for jwk in jwks_data.get('keys', []):
+        kid = jwk.get('kid', 'default_key')
+        public_keys[kid] = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
+
+    if not public_keys:
+        raise ValueError("Casdoor не повернув жодного JWK ключа")
+
+    unverified_header = jwt.get_unverified_header(token)
+    kid = unverified_header.get('kid', 'default_key')
+
+    if kid in public_keys:
+        key = public_keys[kid]
+    else:
+        key = list(public_keys.values())[0]
+
+    payload = jwt.decode(
+        token,
+        key=key,
+        algorithms=["RS256", "RS384", "RS512"],
+        audience=CLIENT_ID,
+        options={"verify_aud": False}
+    )
+    return payload
+
+
+# --- ЕНДПОІНТИ ---
+
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
+
 
 @app.get("/login")
 async def login():
     auth_url = f"{CASDOOR_URL}/login/oauth/authorize?client_id={CLIENT_ID}&response_type=code&redirect_uri={REDIRECT_URI}&scope=read&state=casdoor"
     return RedirectResponse(auth_url)
+
 
 @app.get("/callback")
 async def callback(code: str):
@@ -120,16 +161,23 @@ async def callback(code: str):
     redirect.set_cookie(key="access_token", value=access_token, httponly=False)
     return redirect
 
+
 @app.get("/user-info")
 async def user_info(request: Request):
     token = request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    async with httpx.AsyncClient(verify=False) as client:
-        user_res = await client.get(f"{CASDOOR_URL}/api/userinfo", headers={"Authorization": f"Bearer {token}"})
-    if user_res.status_code != 200:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-    return user_res.json()
+
+    try:
+        # Локальна валідація токена замість запиту до Casdoor
+        payload = await verify_casdoor_token(token)
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
 @app.websocket("/ws")
@@ -144,11 +192,13 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    async with httpx.AsyncClient(verify=False) as client:
-        user_res = await client.get(f"{CASDOOR_URL}/api/userinfo", headers={"Authorization": f"Bearer {token}"})
-        if user_res.status_code != 200:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
+    try:
+        # Локальна валідація токена перед підпискою на WebSockets
+        payload = await verify_casdoor_token(token)
+    except Exception as e:
+        print(f"WebSocket Auth Error: {e}")
+        await websocket.close(code=1008)  # 1008: Policy Violation
+        return
 
     try:
         while True:
